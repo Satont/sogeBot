@@ -1,436 +1,535 @@
-import { parse, sep as separator } from 'path';
+/* eslint-disable import/order */
+'use strict';
 
-import * as constants from '@sogebot/ui-helpers/constants';
-import * as _ from 'lodash';
-import { xor } from 'lodash';
+import _ from 'lodash';
+import { getRepository } from 'typeorm';
 
-import type { Module } from '~/_interface';
-import { isDbConnected } from '~/helpers/database';
-import emitter from '~/helpers/interfaceEmitter';
-import {
-  debug, error, performance,
-} from '~/helpers/log';
-import { defaultPermissions } from '~/helpers/permissions/defaultPermissions';
-import { find } from '~/helpers/register';
-import { VariableWatcher } from '~/watchers';
+import { ModerationPermit } from '../database/entity/moderation';
+import { Settings } from '../database/entity/settings';
+import { User, UserInterface } from '../database/entity/user';
+import { command, default_permission, parser } from '../decorators';
+import { onStreamEnd, onStreamStart } from '../decorators/on';
+import { defaultPermissions } from '../helpers/permissions';
+import System from './_interface';
+import points from './points';
+import { sendMessage } from '../helpers/commons/sendMessage';
+import { isModerator, isOwner } from '../helpers/user';
+import twitch from '../services/twitch'
+import { variables } from '../watchers';
+import { tmiEmitter } from '~/helpers/tmi';
+import media from '~/overlays/media';
 
-export let loadingInProgress: (string|symbol)[] = [];
-export let areDecoratorsLoaded = false;
-export const permissions: { [command: string]: string | null } = {};
+const greetings = [
+  {
+    username: 'sadisnamenya',
+    message: 'Хляньте, 9см в чат зашёл PogChamp Ну привет s4tont',
+    overlay: `type=image url=https://bot.rusty777.ml/gallery/5e13cfa5-a3ca-484d-a492-0e39c9aacf61 time=5000 x-offset=650 y-offset=200 align=center | type=audio url=https://bot.rusty777.ml/gallery/735b7126-c1e2-4596-b2f4-b87c7b535abf volume=50 | type=text text='Хляньте, 9см в чат зашёл PogChamp' time=5000 x-offset=650 y-offset=230 class=text`,
+  },
+  { username: 'rusty', message: 'Бахиня на месте CoolCat' },
+  {
+    username: 'pineapplevan',
+    message: 'Всем встать, уважаемый человек в чат зашел! @vskroisya rustykF',
+    overlay: `type=image url=https://bot.rusty777.ml/gallery/0db974d2-6648-45d9-a448-581eb2f16dfc time=6000 x-offset=650 y-offset=200 align=center | type=audio url=https://bot.rusty777.ml/gallery/1328fe2d-a054-4b3f-ae5d-3b600df4b6bb volume=50 | type=text text='Всем встать, уважаемый человек в чат зашел!' time=5000 x-offset=650 y-offset=230 class=text`,
+  },
+];
 
-export const commandsToRegister: {
-  opts: string | Command;
-  m: { type: string; name: string; fnc: string };
-}[] = [];
-
-const checkIfDecoratorsAreLoaded = () => {
-  if (!isDbConnected) {
-    setTimeout(() => {
-      checkIfDecoratorsAreLoaded();
-    }, 2000);
-    return;
-  }
-  if (loadingInProgress.length === 0) {
-    debug('decorators', 'Loading OK');
-    areDecoratorsLoaded = true;
-  } else {
-    setTimeout(() => {
-      checkIfDecoratorsAreLoaded();
-    }, 2000);
-  }
-};
-checkIfDecoratorsAreLoaded();
-
-function getNameAndTypeFromStackTrace() {
-  const _prepareStackTrace = Error.prepareStackTrace;
-  Error.prepareStackTrace = (_s, s) => s;
-  const stack = (new Error().stack as unknown as NodeJS.CallSite[]);
-  Error.prepareStackTrace = _prepareStackTrace;
-
-  const path = parse(stack[2].getFileName() || '');
-  const _type = path.dir.split(separator)[path.dir.split(separator).length - 1];
-  const type = _type === 'dest' ? 'core' : _type;
-  const name = path.name;
-
-  return { name, type };
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(() => resolve(), ms);
+  });
 }
 
-export function ui(opts: any, category?: string) {
-  const { name, type } = getNameAndTypeFromStackTrace();
+class Rusty extends System {
+  users: string[] = [];
+  kaznYesVotes = 0;
+  kaznNoVotes = 0;
 
-  return (target: any, key: string) => {
-    let path = category ? `${category}.${key}` : key;
-
-    const register = async (retries = 0) => {
-      if (!isDbConnected) {
-        setTimeout(() => register(0), 1000);
-        return;
-      }
-      try {
-        const self = find(type, name);
-        if (!self) {
-          throw new Error(`${type}.${name} not found in list`);
-        }
-        // get category from settingsList
-        if (!category) {
-          const s = self.settingsList.find(o => o.key === path);
-          if (s) {
-            path = s.category? s.category + '.' + path : path;
-          } else {
-            if (retries < 500) { // try to wait to settings to be registered
-              setTimeout(() => register(++retries), 10);
-              return;
-            }
-          }
-        }
-        _.set(self, '_ui.' + path, opts);
-      } catch (e: any) {
-        error(e);
-      }
-    };
-    setTimeout(() => {
-      register();
-    }, 10000);
-  };
-}
-
-export function settings(category?: string, isReadOnly = false) {
-  const { name, type } = getNameAndTypeFromStackTrace();
-
-  return (target: any, key: string) => {
-    if (!isReadOnly) {
-      loadingInProgress.push(`${type}.${name}.${key}`);
-    }
-
-    const registerSettings = async () => {
-      const self = find(type, name);
-      if (!self) {
-        throw new Error(`${type}.${name} not found in list`);
-      }
-      if (!isDbConnected) {
-        setTimeout(() => registerSettings(), 1000);
-        return;
-      }
-      try {
-        const path = `${type}.${name}.${key}`;
-        VariableWatcher.add(path, (self as any)[key], isReadOnly);
-
-        if (!isReadOnly) {
-          // load variable from db
-          const loadVariableValue = () => {
-            if (!isDbConnected) {
-              setTimeout(() => loadVariableValue(), 1000);
-              return;
-            }
-            self.loadVariableValue(key).then((value) => {
-              if (typeof value !== 'undefined') {
-                VariableWatcher.add(path, value, isReadOnly); // rewrite value on var load
-                _.set(self, key, value);
-                emitter.emit('load', path, _.cloneDeep(value));
-              } else {
-                emitter.emit('load', path, _.cloneDeep((self as any)[key]));
-              }
-              loadingInProgress = loadingInProgress.filter(o => o !== path);
-            });
-          };
-          setTimeout(() => loadVariableValue(), 5000);
-        } else {
-          emitter.emit('load', path, _.cloneDeep((self as any)[key]));
-        }
-
-        // add variable to settingsList
-        self.settingsList.push({
-          category, key, defaultValue: (self as any)[key],
-        });
-      } catch (e: any) {
-        error(e.stack);
-      }
-    };
-    setTimeout(() => {
-      registerSettings();
-    }, 10000);
-  };
-}
-
-export function permission_settings(category?: string, exclude: string[] = [], enforcedDefaultValue?: { [permId: string]: any }) {
-  if (typeof category === 'undefined') {
-    category = 'settings';
+  constructor() {
+    super();
   }
 
-  const { name, type } = getNameAndTypeFromStackTrace();
+  @command('!sayb')
+  @default_permission(defaultPermissions.CASTERS)
+  async sayB(msg: CommandOptions | string) {
+    const message = typeof msg === 'string' ? msg : msg.parameters
+    return twitch.tmi?.client.broadcaster?.say(variables.get('services.twitch.broadcasterUsername') as string, message)
+  }
 
-  return (target: any, key: string) => {
-    loadingInProgress.push(`${type}.${name}.${key}`);
+  async getOnlineUsers(): Promise<UserInterface[]> {
+    return await getRepository(User).createQueryBuilder('user')
+      .where('user.username != :botusername', { botusername: (variables.get('services.twitch.botUsername') as string).toLowerCase() })
+      .andWhere('user.username != :broadcasterusername', { broadcasterusername: (variables.get('services.twitch.broadcasterUsername') as string).toLowerCase() })
+      .andWhere('user.isOnline = :isOnline', { isOnline: true })
+      .cache(true)
+      .getMany();
+  }
 
-    const register = async () => {
-      if (!isDbConnected) {
-        setTimeout(() => register(), 1000);
-        return;
-      }
-      try {
-        const self = find(type, name);
-        if (!self) {
-          throw new Error(`${type}.${name} not found in list`);
-        }
+  @command('!smoke')
+  @default_permission(defaultPermissions.SUBSCRIBERS)
+  async smoke(opts: CommandOptions) {
+    await sendMessage('/clear', opts.sender);
+    await sendMessage(`${opts.sender.displayName} заюзал smoke of deceit PogChamp`, opts.sender);
+  }
 
-        _.set(self, '__permission_based__' + key, {}); // set init value
-        VariableWatcher.add(`${type}.${name}.__permission_based__${key}`, {}, false);
+  @command('!gale')
+  @default_permission(defaultPermissions.SUBSCRIBERS)
+  async gale(opts: CommandOptions) {
+    await sendMessage(`Веник смазал этот чатик гелем Kappa `, opts.sender);
+    await sendMessage(`/slow 40`, opts.sender);
+    await sleep(40 * 1000);
+    await sendMessage(`/slowoff`, opts.sender);
+  }
 
-        // load variable from db
-        const loadVariableValue = () => {
-          if (!isDbConnected) {
-            setTimeout(() => loadVariableValue(), 1000);
-            return;
-          }
-          self.loadVariableValue('__permission_based__' + key).then((value?: { [permissionId: string]: string }) => {
-            if (typeof value === 'undefined') {
-              value = {};
-            }
-
-            for (const exKey of exclude) {
-              value[exKey] = '%%%%___ignored___%%%%';
-            }
-
-            // set forced default value
-            if (enforcedDefaultValue) {
-              for (const enforcedKey of Object.keys(enforcedDefaultValue)) {
-                if (typeof value[enforcedKey] === 'undefined' || value[enforcedKey] === null) {
-                  // change only if value is not set manually
-                  value[enforcedKey] = enforcedDefaultValue[enforcedKey];
-                }
-              }
-            }
-
-            VariableWatcher.add(`${type}.${name}.__permission_based__${key}`, value, false);
-            _.set(self, '__permission_based__' + key, value);
-            loadingInProgress = loadingInProgress.filter(o => o !== `${type}.${name}.${key}`);
-          });
-        };
-        setTimeout(() => loadVariableValue(), 5000);
-
-        // add variable to settingsPermList
-        self.settingsPermList.push({
-          category, key, defaultValue: (self as any)[key],
-        });
-      } catch (e: any) {
-        // we don't care about error
-      }
-    };
-    setTimeout(() => {
-      register();
-    }, 10000);
-  };
-}
-
-export function persistent() {
-  const { name, type } = getNameAndTypeFromStackTrace();
-
-  return (target: any, key: string) => {
-    const path = `${type}.${name}.${key}`;
-    loadingInProgress.push(path);
-    const register = async () => {
-      if (!isDbConnected) {
-        setTimeout(() => register(), 1000);
-        return;
-      }
-      try {
-        const self = find(type, name);
-        if (!self) {
-          throw new Error(`${type}.${name} not found in list`);
-        }
-        const defaultValue = (self as any)[key];
-        VariableWatcher.add(path, defaultValue, false);
-        const loadVariableValue = () => {
-          self.loadVariableValue(key).then((value) => {
-            if (typeof value !== 'undefined') {
-              VariableWatcher.add(path, value, false); // rewrite value on var load
-              emitter.emit('load', path, _.cloneDeep(value));
-              _.set(self, key, value);
-            } else {
-              emitter.emit('load', path, _.cloneDeep((self as any)[key]));
-            }
-            loadingInProgress = loadingInProgress.filter(o => o !== path);
-          });
-        };
-        setTimeout(() => loadVariableValue(), 5000);
-      } catch (e: any) {
-        error(e.stack);
-      }
-    };
-    setTimeout(() => {
-      register();
-    }, 10000);
-  };
-}
-
-export function parser(
-  { skippable = false, fireAndForget = false, permission = defaultPermissions.VIEWERS, priority = constants.MEDIUM, dependsOn = [] }:
-  { skippable?: boolean; fireAndForget?: boolean; permission?: string; priority?: number; dependsOn?: import('~/_interface').Module[] } = {}) {
-  const { name, type } = getNameAndTypeFromStackTrace();
-
-  return (target: any, key: string, descriptor: PropertyDescriptor) => {
-    registerParser({
-      fireAndForget, permission, priority, dependsOn, skippable,
-    }, {
-      type, name, fnc: key,
-    });
-    return descriptor;
-  };
-}
-
-export function command(opts: string) {
-  const { name, type } = getNameAndTypeFromStackTrace();
-
-  return (target: any, key: string, descriptor: PropertyDescriptor) => {
-    commandsToRegister.push({
-      opts, m: {
-        type, name, fnc: key,
-      },
-    });
-    return descriptor;
-  };
-}
-
-export function default_permission(uuid: string | null) {
-  const { name, type } = getNameAndTypeFromStackTrace();
-  return (target: any, key: string | symbol, descriptor: PropertyDescriptor) => {
-    permissions[`${type}.${name.toLowerCase()}.${String(key).toLowerCase()}`] = uuid;
-    return descriptor;
-  };
-}
-
-export function helper() {
-  const { name, type } = getNameAndTypeFromStackTrace();
-
-  return (target: any, key: string | symbol, descriptor: PropertyDescriptor) => {
-    registerHelper({
-      type, name, fnc: String(key),
-    });
-    return descriptor;
-  };
-}
-
-export function rollback() {
-  const { name, type } = getNameAndTypeFromStackTrace();
-
-  return (target: any, key: string, descriptor: PropertyDescriptor) => {
-    registerRollback({
-      type, name, fnc: key,
-    });
-    return descriptor;
-  };
-}
-
-function registerHelper(m: { type: string, name: string, fnc: string }, retry = 0) {
-  setTimeout(() => {
-    try {
-      const self = find(m.type, m.name);
-      if (!self) {
-        throw new Error(`${m.type}.${m.name} not found in list`);
-      }
-      // find command with function
-      const c = self._commands.find((o) => o.fnc === m.fnc);
-      if (!c) {
-        throw Error();
-      } else {
-        c.isHelper = true;
-      }
-    } catch (e: any) {
-      if (retry < 100) {
-        return setTimeout(() => registerHelper(m, retry++), 10);
-      } else {
-        error('Command with function ' + m.fnc + ' not found!');
-      }
+  /* @command('!www')
+  @default_permission(defaultPermissions.SUBSCRIBERS)
+  async emp(opts: CommandOptions) {
+    const random: number = _.random(0, 5);
+    const online = await this.getOnlineUsers();
+    const users: UserInterface[] = _.sampleSize(online, random);
+    if (random === 0) {
+      await sendMessage(`${opts.sender.displayName} эта магия разочаровывает. Слишком маленький уровень WEX`, opts.sender);
+      return;
     }
-  }, 5000);
-}
+    await _.forEach(users, async function (o) {
+      await getRepository(User).decrement({ userId: o.userId }, 'points', 50);
+    });
+    const givePts = random * 50;
+    await getRepository(User).decrement({ userId: opts.sender.userId }, 'points', givePts);
+    await sendMessage(`${opts.sender.displayName} экстрагирующий Мана Пульс! Ты успешно выжег ману ${_.join(
+      users.map(o => o.username),
+      ', '
+    )} (${givePts}) rustykMLG `, opts.sender);
+  } */
 
-function registerRollback(m: { type: string, name: string, fnc: string }) {
-  setTimeout(() => {
-    try {
-      const self = find(m.type, m.name);
-      if (!self) {
-        throw new Error(`${m.type}.${m.name} not found in list`);
-      }    self._rollback.push({ name: m.fnc });
-    } catch (e: any) {
-      error(e.stack);
-    }
-  }, 5000);
-}
-
-function registerParser(opts: {
-  permission: string; priority: number, dependsOn: Module[]; fireAndForget: boolean; skippable: boolean;
-}, m: { type: string, name: string, fnc: string }) {
-  setTimeout(() => {
-    try {
-      const self = find(m.type, m.name);
-      if (!self) {
-        throw new Error(`${m.type}.${m.name} not found in list`);
-      }
-      self._parsers.push({
-        name:          m.fnc,
-        permission:    opts.permission,
-        priority:      opts.priority,
-        dependsOn:     opts.dependsOn,
-        skippable:     opts.skippable,
-        fireAndForget: opts.fireAndForget,
+  @command('!hook')
+  @default_permission(defaultPermissions.SUBSCRIBERS)
+  async hook(opts: CommandOptions) {
+    const online = await this.getOnlineUsers()
+    const random = _.random(0, 35);
+    if (random === 0) {
+      await sendMessage(`${opts.sender.displayName} Способность rustykHook не изучена. Длина твоего rustykHook = 0. Ты обложался, друг LUL`, opts.sender);
+    } else if (random <= 10) {
+      const randomUser = _.sample(online);
+      await sendMessage(`${opts.sender.displayName} длина твоего rustykHook  = ${random}см, коротенький но все же ты попал по  ${randomUser}`, opts.sender);
+      tmiEmitter.emit('timeout', randomUser!.userName, 5, isModerator(randomUser!));
+    } else if (random <= 25) {
+      const users = _.sampleSize(online, 2);
+      await sendMessage(`Мясника вызывали? rustykHook ${opts.sender.displayName} попал хуком длиной ${random}см сразу по двоим! ${_.join(users, ', ')} летают на его хуке!`, opts.sender);
+      _.forEach(users, async (user) => {
+        tmiEmitter.emit('timeout', user!.userName, 5, isModerator(user!));
       });
-    } catch (e: any) {
-      error(e.stack);
+    } else if (random <= 34) {
+      const users = _.sampleSize(online, 3);
+      await sendMessage(`Кому свежих рёбрышек? ${opts.sender.displayName} вытянул своим ${random}-сантиметровым инструментом аж 3-их из чата! PogChamp PogChamp ${_.join(users, ', ')} желаю вам хорошо провести время rustykHook`, opts.sender);
+      _.forEach(users, async (user) => {
+        tmiEmitter.emit('timeout', user!.userName, 5, isModerator(user!));
+      });
+    } else if (random <= 35) {
+      const users = _.sampleSize(online, 5);
+      await sendMessage(`rustykHook Хы-хы-хы-хы, свежее мясо! Да этот пудж ${opts.sender.displayName} бешеный! Ты выхукал всю тиму! Твой 35-ти сантиметровый хук видно с другого конца карты! rustykPride Насадил на свой огромный хук ${_.join(users, ', ')}`, opts.sender);
+      _.forEach(users, async (user) => {
+        tmiEmitter.emit('timeout', user!.userName, 5, isModerator(user!));
+      });
     }
-  }, 5000);
-}
+  }
 
-export function IsLoadingInProgress(name: symbol) {
-  return loadingInProgress.includes(name);
-}
+  @command('!buff')
+  @default_permission(defaultPermissions.SUBSCRIBERS)
+  async buff(opts: CommandOptions) {
+    const array = [
+      'Лич накинул на тебя ICE ARMOR!',
+      'Заботливый Огр юзанул на тебя BLOODLUST!',
+      'WEAWE от Даззла поможет тебе!',
+      'Даже Бладсикер беспокоится о тебе, лови BLOODRAGE!',
+      'Природа не всегда добра, но теперь ты под LIVING ARMOR!',
+    ];
+    await sendMessage(`${opts.sender.displayName} ${_.sample(array)} Можешь запостить 1 ссылку в чат`, opts.sender);
+    await getRepository(ModerationPermit).insert({ userId: opts.sender.userId });
+  }
 
-export function toggleLoadingInProgress(name: symbol) {
-  loadingInProgress = xor(loadingInProgress, [name]);
-}
+  @command('!march')
+  @default_permission(defaultPermissions.SUBSCRIBERS)
+  async march(opts: CommandOptions) {
+    await sendMessage(`Go my little friends! Go! March, March! March! March!`, opts.sender);
+    await sendMessage('/emoteonly', opts.sender);
+    await sleep(30 * 1000);
+    await sendMessage(`/emoteonlyoff`, opts.sender);
+  }
 
-export function timer() {
-  return (_target: any, key: string | symbol, descriptor: any) => {
-    const method = descriptor.value;
+  @command('!echo')
+  @default_permission(defaultPermissions.SUBSCRIBERS)
+  async echo(opts: CommandOptions) {
+    await sendMessage(`/subscribers`, opts.sender);
+    await sendMessage(`${opts.sender.displayName} Echo slamma jamma! отличный врыв от ${opts.sender.displayName}`, opts.sender);
+    await sleep(60 * 1000);
+    await sendMessage('/subscribersoff', opts.sender);
+  }
 
-    if (method.constructor.name === 'AsyncFunction') {
-      descriptor.value = async function (){
-        const Parser = require('~/parser.js').Parser;
-        const Message = require('~/message.js').Message;
+  @command('!kill')
+  @default_permission(defaultPermissions.SUBSCRIBERS)
+  async kill(opts: CommandOptions) {
+    const p: string = _.toLower(_.replace(opts.parameters, '@', ''));
+    const pu = await getRepository(User).findOne({ userName: p });
 
-        const start = Date.now();
-        // eslint-disable-next-line prefer-rest-params
-        const result = await method.apply(this, arguments);
-        if (this instanceof Parser) {
-          performance(`[PARSER#${this.id}|${String(key)}] ${Date.now() - start}ms`);
-        } else {
-          if (this instanceof Message) {
-            performance(`[MESSAGE#${this.id}|${String(key)}] ${Date.now() - start}ms`);
-          } else {
-            performance(`[${this.constructor.name.toUpperCase()}|${String(key)}] ${Date.now() - start}ms`);
-          }
-        }
-        return result;
-      };
+    if (!pu) {
+      return;
+    }
+    if (isOwner(pu) || p === 'forgesplrit') {
+      await sendMessage(`${opts.sender.displayName} невежество предопределило твой крах.`, opts.sender);
+      tmiEmitter.emit('timeout', pu.userName, 30, isModerator(pu));
     } else {
-      descriptor.value = function (){
-        const Parser = require('~/parser.js').Parser;
-        const Message = require('~/message.js').Message;
-
-        const start = Date.now();
-        // eslint-disable-next-line prefer-rest-params
-        const result = method.apply(this, arguments);
-        if (this instanceof Parser) {
-          performance(`[PARSER#${this.id}|${String(key)}] ${Date.now() - start}ms`);
-        } else {
-          if (this instanceof Message) {
-            performance(`[MESSAGE#${this.id}|${String(key)}] ${Date.now() - start}ms`);
-          } else {
-            performance(`[${this.constructor.name.toUpperCase()}|${String(key)}] ${Date.now() - start}ms`);
-          }
-        }
-        return result;
-      };
+      await sendMessage(`Я слышал писк? Должно быть наступил на что-то. ${pu.userName} изгнан в небытие на 30 секунд.`, opts.sender);
+      tmiEmitter.emit('timeout', pu.userName, 30, isModerator(pu));
     }
-  };
+  }
+
+  @command('!zeus')
+  @default_permission(defaultPermissions.SUBSCRIBERS)
+  async zeus(opts: CommandOptions) {
+    const online = await this.getOnlineUsers()
+    _.forEach(online, async (user) => {
+      tmiEmitter.emit('timeout', user.userName, 2, isModerator(user));
+    });
+    const aghanim = _.random(0, 1);
+    if (aghanim === 0) {
+      await sendMessage(`От гнева небес не скрыться! @${opts.sender.userName} прожал THUNDERGOD'S WRAITH! rustykZeusLUL`, opts.sender);
+    } else {
+      const random = _.sample(online);
+      await sendMessage(`От гнева небес не скрыться! @${opts.sender.userName} прожал THUNDERGOD'S WRAITH! Да ты еще и с аганимом?! NIMBUS вырубает @${random} Дай Бог тебе по сусалам! rustykZeusLUL`, opts.sender);
+      tmiEmitter.emit('timeout', random!.userName, 30, isModerator(random!));
+    }
+  }
+
+ /*  @command('!call')
+  @default_permission(defaultPermissions.SUBSCRIBERS)
+  async call(opts: CommandOptions) {
+    const array: string[] = [`NATURE'S CALL! Мы всего лишь глупые пеньки, но ты $sender определенно не бревно SSSsss`, `SPAWN SPIDERLINGS! $sender Ты не наша мама! Выводку нужна еда pastaThat DoritosChip Спасибо что пришел TPFufun И у тебя на носу павук.`, `SUMMON WOLVES! Ааауууууууууу!! Человек человеку волк. Добро пожаловать в стаю $sender!`, `CALL OF THE WILD! Ммм.. поймал твой запах $sender, теперь ты наша добыча!`, `DEMONIC CONVERSION! $sender ты зашел на затухающую орбиту и мы чувствуем пустоту внутри тебя. Позволь нам заполнить ее смертью. PurpleStar`, `SUMMON SPIRIT BEAR! Медведь. Водка. Балалайка. Ti ruski? RitzMitz`];
+    const randomed = _.sample(array) as string;
+    const result = _.replace(randomed, '$sender', opts.sender.username);
+    await sendMessage(result, opts.sender);
+  } */
+
+  @command('!sniper')
+  @default_permission(defaultPermissions.SUBSCRIBERS)
+  async sniper(opts: CommandOptions) {
+    await sendMessage(`/me ${opts.sender.userName} прицеливается..`, opts.sender);
+    await sleep(1000);
+    await sendMessage(`/me ${opts.sender.userName} передергивает затвор...`, opts.sender);
+    await sleep(3000);
+    this.sniperHelper(opts);
+  }
+  async sniperHelper(opts: CommandOptions) {
+    const random = _.random(1, 6);
+    const online = await this.getOnlineUsers()
+    const sender = await getRepository(User).findOne({ userId: opts.sender.userId })
+
+    switch (random) {
+      case 1:
+        await sendMessage(`${opts.sender.userName} ты промазал rustykRaki`, opts.sender);
+        break;
+      case 2:
+        await sendMessage(`${opts.sender.userName} ты попал по ${_.sample(online)?.userName}, но не по голове rustykBebe`, opts.sender);
+        break;
+      case 3:
+        const user = _.sample(online);
+        await sendMessage(`${opts.sender.userName} убивает выстрелом в голову ${user?.userName} PogChamp rustykStreamSniper`, opts.sender);
+        tmiEmitter.emit('timeout', user!.userName, 10, isModerator(user!));
+        break;
+      case 4:
+        await sendMessage(`${opts.sender.userName} ты бы хоть обойму проверил, у тебя нет патронов Jebaited Пока ты тормозил тебя убили... MingLee `, opts.sender);
+        tmiEmitter.emit('timeout', opts.sender.userName, 15, isModerator(sender!));
+        break;
+      case 5:
+        const firstUser = _.sample(online);
+        const secondUser = _.sample(online);
+        await sendMessage( `${opts.sender.userName} убивает одним выстрелом сразу двоих  ${firstUser?.userName}, ${secondUser?.userName} PogChamp Пробил 2 каски из M200, ${opts.sender.userName} ты лучший снайпер этого чата! rustykTOP rustykStreamSniper rustykTOP`, opts.sender);
+
+        [firstUser, secondUser].forEach(user => {
+          tmiEmitter.emit('timeout', user!.userName, 20, isModerator(user!));
+        });
+
+        break;
+      case 6:
+        await sendMessage(`${opts.sender.userName} а какой вообще смысл если ты все равно умрешь от зоны? LUL`, opts.sender);
+        tmiEmitter.emit('timeout', opts.sender.userName, 10, isModerator(sender!));
+        await sendMessage(`/me ${opts.sender.userName} умер от зоны и потерял весь лут пока целился rustykRaki`, opts.sender);
+        break;
+    }
+  }
+
+  @command('!казнь')
+  @default_permission(defaultPermissions.VIEWERS)
+  async kazn(opts: CommandOptions) {
+    const query = await getRepository(Settings).findOne({ name: 'kazn' });
+
+    if (!query) {
+      return;
+    }
+
+    const current: { runned: boolean; sender: string | null; target: string | null } = JSON.parse(query.value);
+
+    if (current && current.runned === true) {
+      return;
+    }
+
+    const target = await getRepository(User).findOne({ userName: _.toLower(_.replace(opts.parameters, '@', '')) });
+
+    if (!target || isOwner(target)) {
+      return;
+    }
+
+    await sendMessage(`/me @${opts.sender.userName} считает что @${target} нужно приговорить к таймауту на 100 с. Голосование за КАЗНЬ @${target.userName} напишите в чат "да" если @${target.userName}  недостоин находиться в чатике, напишите "нет" чтобы помиловать и спасти от казни.`, opts.sender);
+    await sendMessage(`/me @${target.userName}  у тебя есть минута, пока чат присяжных принимает решение, ANY LAST WORD?`, opts.sender);
+
+    query.value = JSON.stringify({ runned: true, target: target.userName, sender: opts.sender.userName });
+    await getRepository(Settings).save(query);
+
+    await sleep(60 * 1000);
+    await this.verdict(opts);
+  }
+
+  async verdict(opts: CommandOptions) {
+    const query = await getRepository(Settings).findOne({ name: 'kazn' });
+
+    if (!query) {
+      return;
+    }
+
+    const kazn = JSON.parse(query.value);
+    const target = await getRepository(User).findOne({ userName: kazn.target });
+    const sender = await getRepository(User).findOne({ userName: kazn.sender });
+
+    if (!target || !sender) {
+      return;
+    }
+
+    if (this.kaznYesVotes > this.kaznNoVotes) {
+      await sendMessage(`/me @${kazn.target} чат постановил: ВИНОВЕН! Ты приговорен к СМЭРТИ на 100 сек. Твой палач @${kazn.sender}`, opts.sender);
+      tmiEmitter.emit('timeout', target.userName, 100, isModerator(target!));
+    } else {
+      await sendMessage(`/me @${target.userName} чат постановил: НЕ ВИНОВЕН! Тебя пощадил милостивый чат, ты свободен! @${sender.userName} осужден за клевету и изгнан на 50 сек.`, opts.sender);
+      tmiEmitter.emit('timeout', sender.userName, 50, isModerator(sender!));
+    }
+    await sendMessage(`/me Голосов за: ${this.kaznYesVotes}, против: ${this.kaznNoVotes}`, opts.sender);
+    query.value = JSON.stringify({ runned: false, target: null, sender: null });
+    await getRepository(Settings).save(query);
+    this.kaznNoVotes = 0;
+    this.kaznYesVotes = 0;
+  }
+
+  @parser({ fireAndForget: true })
+  async kaznParser(opts: ParserOptions) {
+    const query = await getRepository(Settings).findOne({ name: 'kazn' });
+    if (!query) {
+      return;
+    }
+    const current = JSON.parse(query.value);
+
+    if (current.runned === false) {
+      return;
+    }
+
+    if (opts.message.toLowerCase() === 'да' || opts.message.toLowerCase() === 'lf') {
+      this.kaznYesVotes++;
+    }
+    if (opts.message.toLowerCase() === 'нет' || opts.message.toLowerCase() === 'ytn') {
+      this.kaznNoVotes++;
+    }
+  }
+
+  @parser({ fireAndForget: true })
+  async mirrobot(opts: ParserOptions) {
+    const message = opts.message;
+
+    if (opts.sender?.userName === 'mirrobot' && message.includes('дал верный ответ')) {
+      const winner = opts.message.split(' ')[0];
+      await getRepository(User).increment({ userName: winner }, 'points', 100);
+      await sendMessage(`@${winner} получает 100 mp за правильный ответ!`, opts.sender);
+    }
+  }
+
+  @parser({ fireAndForget: true })
+  async greetings(opts: ParserOptions) {
+    const user = greetings.find(o => o.username === opts.sender?.userName);
+    if (!opts.sender?.userName) return
+
+    if (user && this.users.indexOf(opts.sender.userName) < 0) {
+
+      this.users.push(opts.sender.userName);
+      await sendMessage(user.message, opts.sender);
+      if (user.overlay) {
+        await media.overlay({
+          command: 'alert',
+          sender: opts.sender,
+          parameters: user.overlay,
+          createdAt: Date.now(),
+          attr: { skip: false, quiet: false },
+          emotesOffsets: new Map(),
+          discord: undefined,
+          isAction: false,
+          isFirstTimeMessage: false
+        });
+      }
+    }
+  }
+
+  @onStreamEnd()
+  start() {
+    console.log('Stream ended, users cleared');
+    this.users = [];
+  }
+
+  @onStreamStart()
+  end() {
+    console.log('Stream started, users cleared');
+    this.users = [];
+  }
+
+  @command('!распылить')
+  @default_permission(defaultPermissions.VIEWERS)
+  async spray(opts: CommandOptions) {
+    let howMuch = parseInt(opts.parameters, 10);
+    if (howMuch < 0 || howMuch === 0) {
+      return sendMessage(`@${opts.sender.displayName} ага да проверяй`, opts.sender);
+    }
+    if (_.isNaN(howMuch)) {
+      return;
+    }
+
+    const availablePoints = await points.getPointsOf(opts.sender.userId);
+    if (availablePoints < howMuch) {
+      return sendMessage(`@${opts.sender.displayName} недостаточно поинтов`, opts.sender);
+    }
+    await getRepository(User).increment({ userId: opts.sender.userId }, 'points', -Math.min(howMuch, availablePoints));
+    const onlineUsers = await this.getOnlineUsers();
+
+    if (howMuch <= 1000) {
+      let i = 0;
+      for (const item of onlineUsers) {
+        if (i >= 3) {
+          break;
+        }
+        let toUser;
+        if (i === 2) {
+          toUser = howMuch;
+        } else {
+          toUser = _.random(0, howMuch);
+        }
+
+        // _.remove(onlineUsers, o => o.id === item.id)
+
+        await sendMessage(`@${item.userName} получает ${toUser} mp!`, opts.sender);
+        await getRepository(User).increment({ userId: item.userId }, 'points', toUser);
+        howMuch = howMuch - toUser;
+        i++;
+      }
+    } else if (1000 < howMuch && howMuch <= 5000) {
+      let i = 0;
+      for (const item of onlineUsers) {
+        if (i >= 5) {
+          break;
+        }
+        let toUser;
+        if (i === 4) {
+          toUser = howMuch;
+        } else {
+          toUser = _.random(0, howMuch);
+        }
+
+        // _.remove(onlineUsers, o => o.id === item.id)
+
+        await sendMessage(`@${item.userName} получает ${toUser} mp!`, opts.sender);
+        await getRepository(User).increment({ userId: item.userId }, 'points', toUser);
+        howMuch = howMuch - toUser;
+        i++;
+      }
+    } else if (5000 < howMuch && howMuch <= 10000) {
+      let i = 0;
+      for (const item of onlineUsers) {
+        if (i >= 7) {
+          break;
+        }
+        let toUser;
+        if (i === 6) {
+          toUser = howMuch;
+        } else {
+          toUser = _.random(0, howMuch);
+        }
+
+        // _.remove(onlineUsers, o => o.id === item.id)
+
+        await sendMessage(`@${item.userName} получает ${toUser} mp!`, opts.sender);
+        await getRepository(User).increment({ userId: item.userId }, 'points', toUser);
+        howMuch = howMuch - toUser;
+        i++;
+      }
+    } else if (howMuch >= 20000) {
+      let i = 0;
+      for (const item of onlineUsers) {
+        if (i >= 10) {
+          break;
+        }
+        let toUser;
+        if (i === 9) {
+          toUser = howMuch;
+        } else {
+          toUser = _.random(0, howMuch);
+        }
+
+        // _.remove(onlineUsers, o => o.id === item.id)
+
+        await sendMessage(`@${item.userName} получает ${toUser} mp!`, opts.sender);
+        await getRepository(User).increment({ userId: item.userId }, 'points', toUser);
+        howMuch = howMuch - toUser;
+        i++;
+      }
+    }
+  }
+
+  @command('!luck')
+  @default_permission(defaultPermissions.VIEWERS)
+  async luck(opts: CommandOptions) {
+    let userPoints;
+    let bet = opts.parameters.split(' ')[0];
+    if (bet === 'все' || bet === 'всё' || bet === 'all') {
+      userPoints = await points.getPointsOf(opts.sender.userId);
+      bet = userPoints.toString();
+    } else if (isNaN(_.toNumber(bet))) {
+      return await sendMessage(`${opts.sender.displayName} хм, уверен, что используешь команду правильно? !luck 50`, opts.sender);
+    }
+    if (_.toNumber(bet) < 50) {
+      return await sendMessage(`${opts.sender.displayName} минимальное число - 50`, opts.sender);
+    }
+
+    userPoints = await points.getPointsOf(opts.sender.userId);
+
+    if (userPoints < _.toNumber(bet)) {
+      return await sendMessage(`${opts.sender.displayName} у тебя не хватает mp, минимальное число - 50`, opts.sender);
+    }
+    const rand = Math.floor(Math.random() * 100);
+
+    await getRepository(User).decrement({ userId: opts.sender.userId }, 'points', _.toNumber(bet));
+
+    if (rand >= 1 && rand <= 3) {
+      await sendMessage(`${opts.sender.displayName}, кажется, запахло жареным! MULTICAST x5 с шансом 1% впервые в истории!!! PogChamp PogChamp PogChamp Поздравляю, теперь у тебя ${(_.toNumber(bet) * 5) + (userPoints - _.toNumber(bet))} mp!`, opts.sender);
+
+      await getRepository(User).increment({ userId: opts.sender.userId }, 'points', _.toNumber(bet) * 5);
+    } else if (rand >= 3 && rand <= 5) {
+      await sendMessage(`${opts.sender.displayName} стоило бы это потушить rustykMlg MULTICAST x4 с вероятностью 3% дарует тебе ${_.toNumber(bet) * 4} mp! rustykAhegao`, opts.sender);
+      await getRepository(User).increment({ userId: opts.sender.userId }, 'points', _.toNumber(bet) * 4);
+    } else if (rand >= 5 && rand <= 7) {
+      await sendMessage(`${opts.sender.displayName} шанс выпадения MULTICAST x3 = 5%! rustykAhegao Поздравляю, теперь у тебя ${(_.toNumber(bet) * 3) + (userPoints - _.toNumber(bet))} mp! :)`, opts.sender);
+      await getRepository(User).increment({ userId: opts.sender.userId }, 'points', _.toNumber(bet) * 3);
+    } else if (rand >= 7 && rand <= 20) {
+      await sendMessage(`${opts.sender.displayName}, отличная новость: ты ничего не потерял! Плохие новости: ты ничего не выиграл rustykBebe `, opts.sender);
+      await getRepository(User).increment({ userId: opts.sender.userId }, 'points', _.toNumber(bet));
+    } else if (rand >= 20 && rand <= 30) {
+      await sendMessage(`${opts.sender.displayName} поздравляю ты выиграл! Multicast x2! Теперь у тебя ${(_.toNumber(bet) * 2) + (userPoints - _.toNumber(bet))} mp`, opts.sender);
+      await getRepository(User).increment({ userId: opts.sender.userId }, 'points', _.toNumber(bet) * 2);
+    } else if (rand >= 30 && rand <= 100) {
+      await sendMessage(`${opts.sender.displayName}, ты проиграл rustykSAD Теперь у тебя ${userPoints - _.toNumber(bet)} mp.`, opts.sender);
+    }
+  }
 }
+
+export default new Rusty();
